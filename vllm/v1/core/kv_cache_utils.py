@@ -1361,9 +1361,24 @@ def _fit_paddable_attention_under_mla_page(
     }
     if not mla_pages or max_page_size in mla_pages:
         return kv_cache_spec, max_page_size
+
+    def _abandon(reason: str) -> tuple[dict[str, KVCacheSpec], int]:
+        pages_by_type: dict[str, set[int]] = {}
+        for spec in kv_cache_spec.values():
+            pages_by_type.setdefault(type(spec).__name__, set()).add(
+                spec.page_size_bytes
+            )
+        logger.info_once(
+            "Cannot bound the unified KV page by the MLA page (%s); page sizes "
+            "by spec type: %s",
+            reason,
+            {k: sorted(v) for k, v in pages_by_type.items()},
+        )
+        return kv_cache_spec, max_page_size
+
     target = max(mla_pages)
     if any(target % page for page in mla_pages):
-        return kv_cache_spec, max_page_size
+        return _abandon("MLA pages are not multiples of the largest MLA page")
     resized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_spec.items():
         if (
@@ -1375,7 +1390,7 @@ def _fit_paddable_attention_under_mla_page(
             new_block_size = (target // per_token) // _ATTN_BLOCK_GRANULARITY
             new_block_size *= _ATTN_BLOCK_GRANULARITY
             if new_block_size < _ATTN_BLOCK_GRANULARITY:
-                return kv_cache_spec, max_page_size
+                return _abandon(f"{layer_name} cannot fit a block under it")
             logger.info_once(
                 "Layer %s: block size %d -> %d so that its KV page fits under "
                 "the MLA page (%d bytes); the page is padded to match.",
@@ -1385,8 +1400,8 @@ def _fit_paddable_attention_under_mla_page(
                 target,
             )
             resized[layer_name] = replace(spec, block_size=new_block_size)
-        elif spec.page_size_bytes > target and not isinstance(spec, MambaSpec):
-            return kv_cache_spec, max_page_size
+        elif spec.page_size_bytes > target:
+            return _abandon(f"{layer_name} ({type(spec).__name__}) is larger")
         else:
             resized[layer_name] = spec
     return resized, target
