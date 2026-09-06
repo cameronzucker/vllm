@@ -1332,6 +1332,66 @@ def _glm5_next_tensor_layout(
     )
 
 
+# Attention kernels take block sizes in multiples of this many tokens; a page
+# padded to a larger physical size keeps its logical block, so the block chosen
+# here must be one the kernels can run directly.
+_ATTN_BLOCK_GRANULARITY = 16
+
+
+def _fit_paddable_attention_under_mla_page(
+    kv_cache_spec: dict[str, KVCacheSpec], max_page_size: int
+) -> tuple[dict[str, KVCacheSpec], int]:
+    """Bound the unified page by the largest MLA page when possible.
+
+    MLA specs can neither be padded nor block-scaled by a non-integer ratio
+    (sparse MLA indexes the cache in whole token rows), so when a paddable
+    non-MLA attention layer owns the largest page — a GQA drafter (EAGLE-3 /
+    DFlash) loaded next to a DS-MLA target, whose bf16 K/V rows are several
+    times wider than the packed MLA row — unifying up to that page fails for
+    every MLA layer. Instead, shrink the block of each such paddable layer so
+    its page fits under the largest MLA page, and let the caller pad it up.
+    Returns the (possibly rewritten) specs and the page size to unify to.
+    Falls back to the original inputs whenever the fit is not exact for the
+    MLA layers or a block would drop below the kernel granularity.
+    """
+    mla_pages = {
+        spec.page_size_bytes
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, MLAAttentionSpec)
+    }
+    if not mla_pages or max_page_size in mla_pages:
+        return kv_cache_spec, max_page_size
+    target = max(mla_pages)
+    if any(target % page for page in mla_pages):
+        return kv_cache_spec, max_page_size
+    resized: dict[str, KVCacheSpec] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        if (
+            isinstance(spec, AttentionSpec)
+            and not isinstance(spec, MLAAttentionSpec)
+            and spec.page_size_bytes > target
+        ):
+            per_token = spec.unpadded_page_size_bytes // spec.block_size
+            new_block_size = (target // per_token) // _ATTN_BLOCK_GRANULARITY
+            new_block_size *= _ATTN_BLOCK_GRANULARITY
+            if new_block_size < _ATTN_BLOCK_GRANULARITY:
+                return kv_cache_spec, max_page_size
+            logger.info_once(
+                "Layer %s: block size %d -> %d so that its KV page fits under "
+                "the MLA page (%d bytes); the page is padded to match.",
+                layer_name,
+                spec.block_size,
+                new_block_size,
+                target,
+            )
+            resized[layer_name] = replace(spec, block_size=new_block_size)
+        elif spec.page_size_bytes > target and not isinstance(spec, MambaSpec):
+            return kv_cache_spec, max_page_size
+        else:
+            resized[layer_name] = spec
+    return resized, target
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1362,6 +1422,9 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    kv_cache_spec, max_page_size = _fit_paddable_attention_under_mla_page(
+        kv_cache_spec, max_page_size
+    )
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
