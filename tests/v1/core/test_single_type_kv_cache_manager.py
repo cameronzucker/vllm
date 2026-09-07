@@ -807,3 +807,27 @@ def test_sliding_window_eagle_group_retains_one_extra_block():
     with_eagle = manager.get_num_skipped_tokens(num_computed)
     assert without > 0
     assert with_eagle == without - block_size
+
+
+def test_sliding_window_eagle_group_caches_every_block():
+    """Under sparse retention an EAGLE-flagged sliding-window group would keep
+    only a tail that includes the never-cached lookahead block; every block is
+    reachable for such groups instead."""
+    spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    kwargs = dict(
+        start_block=0,
+        end_block=10,
+        alignment_tokens=2,
+        kv_cache_spec=spec,
+        retention_interval=0,
+        reachable_boundaries=[19],
+    )
+    sparse = SlidingWindowManager.reachable_block_mask(use_eagle=False, **kwargs)
+    assert sparse is not None and not all(sparse)
+    assert SlidingWindowManager.reachable_block_mask(use_eagle=True, **kwargs) is None

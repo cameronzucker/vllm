@@ -1044,6 +1044,16 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if alignment_tokens is None:
             # Fast path: when the coordinator imposes no alignment constraint.
             return None
+        if use_eagle:
+            # An EAGLE-flagged group's hit needs one block more than the window,
+            # ending one block past the aligned boundary. Under sparse retention
+            # that tail includes the lookahead block, which is only ever cached
+            # when the request runs at least one full block past its prompt;
+            # a request that stops earlier (the common repeated-prefix case)
+            # leaves one block too few and every hit is vetoed. Keep every
+            # block reachable for such groups: they are drafters, and their
+            # blocks are allocated regardless.
+            return None
         block_size = kv_cache_spec.block_size * dcp_world_size
         if alignment_tokens % block_size != 0:
             # The mask is block-granular, so a sub-block alignment cannot be
