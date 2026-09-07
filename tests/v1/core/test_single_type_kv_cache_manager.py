@@ -781,3 +781,29 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_sliding_window_eagle_group_retains_one_extra_block():
+    """An EAGLE-flagged sliding-window group keeps one block more than its
+    window allocated: the coordinator's cache hit needs
+    ``cdiv(window - 1, block) + 1`` contiguous cached blocks (the matched run's
+    last block is dropped), and blocks freed as skipped become null blocks that
+    are never registered in the prefix cache."""
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+
+    block_pool = BlockPool(num_gpu_blocks=2000, enable_caching=True, hash_block_size=2)
+
+    manager = get_sliding_window_manager(sliding_window_spec, block_pool)
+    block_size = sliding_window_spec.block_size
+    num_computed = 20 * block_size
+    without = manager.get_num_skipped_tokens(num_computed)
+    manager.use_eagle = True
+    with_eagle = manager.get_num_skipped_tokens(num_computed)
+    assert without > 0
+    assert with_eagle == without - block_size

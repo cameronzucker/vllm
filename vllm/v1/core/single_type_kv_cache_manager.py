@@ -1143,7 +1143,15 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         """
         return max(
             0,
-            num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+            num_computed_tokens
+            - self.sliding_window
+            + 1
+            - self.extra_retained_tokens
+            # An EAGLE-flagged group's cache hit needs one block more than the
+            # window (the matched run's last block is dropped), so keep that
+            # block allocated: freed blocks become null blocks and are never
+            # registered in the prefix cache.
+            - (self.block_size if self.use_eagle else 0),
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
