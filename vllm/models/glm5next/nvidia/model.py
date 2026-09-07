@@ -46,6 +46,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
 )
+from vllm.model_executor.layers.sparse_index_geometry import (
+    SM120_SPARSE_INDEX_WIDTH,
+    kpool_effective_topk,
+    natural_topk_buffer_width,
+    topk_buffer_width,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -575,50 +581,43 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
-# The sparse-MLA decode kernels are instantiated for an index width of 2048.
-SPARSE_INDEX_KERNEL_WIDTH = 2048
+def sparse_index_kernel_width() -> int | None:
+    """Fixed index width of the sparse-MLA kernels on this device, or None when
+    the kernels take the indexer's natural row width. The SM120 (compute
+    capability 12.x) FlashInfer sparse-MLA path reads exactly 2048 entries."""
+    if not current_platform.is_cuda():
+        return None
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability.major == 12:
+        return SM120_SPARSE_INDEX_WIDTH
+    return None
 
 
-def fit_sparse_index_topk(config) -> int:
-    """Return the effective ``index_topk`` for the sparse indexer.
-
-    With ``index_kpool > 1`` the always-selected pool tail widens the top-k
-    buffer past ``index_topk`` (2048 + 3 -> 2176 for GLM-5.3-Flash), which no
-    compiled sparse-MLA shape serves. Fit the effective top-k so the widened
-    buffer stays within the kernel width instead of requiring users to edit
-    ``index_topk`` in ``config.json`` (the 2044/2045 every GB10 / RTX PRO
-    recipe applies by hand). ``select_k = topk // kpool`` is unchanged for
-    2045 vs 2044 (511 pools). The fitted value is written back to ``config`` so
-    every consumer of this config (target model, MTP draft, attention backend
-    checks) sees the same width.
-    """
-    topk_tokens = config.index_topk
-    assert topk_tokens is not None
+def allocate_topk_indices_buffer(
+    config, max_num_batched_tokens: int, device
+) -> torch.Tensor:
+    """The shared sparse top-k index buffer for a kpool indexer, narrowed to
+    the kernel's index width on devices whose kernels cannot read the natural
+    ``index_topk + tail`` row (see ``sparse_index_geometry``)."""
+    index_topk = config.index_topk
+    assert index_topk is not None
     kpool = config.index_kpool
     assert kpool is not None
-    tail = kpool - 1 if kpool > 1 else 0
-    overflows = topk_tokens + tail > SPARSE_INDEX_KERNEL_WIDTH
-    if tail and overflows and topk_tokens <= SPARSE_INDEX_KERNEL_WIDTH:
-        fitted = SPARSE_INDEX_KERNEL_WIDTH - tail
+    kernel_width = sparse_index_kernel_width()
+    width = topk_buffer_width(index_topk, kpool, kernel_width)
+    natural = natural_topk_buffer_width(index_topk, kpool)
+    if width != natural:
         logger.info_once(
-            "GLM-5.3 sparse indexer: index_topk=%d + kpool tail %d exceeds "
-            "the %d-wide sparse index; using effective index_topk=%d "
-            "(%d pools).",
-            topk_tokens,
-            tail,
-            SPARSE_INDEX_KERNEL_WIDTH,
-            fitted,
-            fitted // kpool,
+            "GLM-5.3 sparse indexer: index_topk=%d + kpool tail %d needs a "
+            "%d-wide index row but this device's sparse-MLA kernels read %d; "
+            "selecting %d pools per row (tail kept, last slot masked).",
+            index_topk,
+            kpool - 1,
+            natural,
+            width,
+            kpool_effective_topk(index_topk, kpool, width) // kpool,
         )
-        config.index_topk = fitted
-        text_config = getattr(config, "text_config", None)
-        if (
-            text_config is not None
-            and getattr(text_config, "index_topk", None) == fitted + tail
-        ):
-            text_config.index_topk = fitted
-        return fitted
-    return topk_tokens
+    return torch.empty(max_num_batched_tokens, width, dtype=torch.int32, device=device)
 
 
 class Glm5NextModel(nn.Module):
@@ -633,21 +632,8 @@ class Glm5NextModel(nn.Module):
 
         self.is_v32 = config.index_topk is not None
         if self.is_v32:
-            topk_tokens = fit_sparse_index_topk(config)
-            # Reserve room for the incomplete pool tail.
-            kpool = config.index_kpool
-            assert kpool is not None
-            buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-            # Sparse MLA tiles top-k in 128 columns; padded slots remain masked.
-            sparse_topk_block_n = 128
-            buffer_width = (
-                (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
-            ) * sparse_topk_block_n
-            topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                buffer_width,
-                dtype=torch.int32,
-                device=self.device,
+            topk_indices_buffer = allocate_topk_indices_buffer(
+                config, vllm_config.scheduler_config.max_num_batched_tokens, self.device
             )
         else:
             # Full-MLA config (no kpool sparse indexer): no topk buffer.

@@ -31,7 +31,7 @@ from .model import (
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
-    fit_sparse_index_topk,
+    allocate_topk_indices_buffer,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -49,21 +49,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
-        # Reserve room for the incomplete pool tail and align the sparse MLA
-        # buffer width to BLOCK_N=128.
-        topk_tokens = fit_sparse_index_topk(config)
-        kpool = config.index_kpool
-        assert kpool is not None
-        buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-        sparse_topk_block_n = 128
-        buffer_width = (
-            (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
-        ) * sparse_topk_block_n
-        topk_indices_buffer = torch.empty(
+        topk_indices_buffer = allocate_topk_indices_buffer(
+            config,
             vllm_config.scheduler_config.max_num_batched_tokens,
-            buffer_width,
-            dtype=torch.int32,
-            device=current_platform.device_type,
+            current_platform.device_type,
         )
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config

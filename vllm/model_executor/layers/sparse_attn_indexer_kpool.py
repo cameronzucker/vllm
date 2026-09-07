@@ -13,6 +13,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.sparse_index_geometry import kpool_effective_topk
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -291,6 +292,11 @@ def sparse_attn_indexer_kpool(
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    # Select whole pools that fit next to the tail in the buffer the model
+    # allocated (narrower than topk + tail on kernels with a fixed index width).
+    topk_tokens = kpool_effective_topk(
+        topk_tokens, index_kpool, topk_indices_buffer.shape[1]
+    )
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
