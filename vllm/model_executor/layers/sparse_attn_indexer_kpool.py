@@ -292,9 +292,11 @@ def sparse_attn_indexer_kpool(
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
-    # Select whole pools that fit next to the tail in the buffer the model
-    # allocated (narrower than topk + tail on kernels with a fixed index width).
-    topk_tokens = kpool_effective_topk(
+    # Pools are selected so that the expanded pools plus the tail fit in the
+    # buffer the model allocated (narrower than topk + tail on kernels with a
+    # fixed index width). Only pool selection uses this; the short-sequence
+    # decisions and the kernel's read count keep ``topk_tokens``.
+    pool_topk_tokens = kpool_effective_topk(
         topk_tokens, index_kpool, topk_indices_buffer.shape[1]
     )
 
@@ -539,7 +541,9 @@ def sparse_attn_indexer_kpool(
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
-            select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+            select_k = (
+                pool_topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+            )
             if index_kpool > 1:
                 pool_topk = torch.empty(
                     (num_rows, select_k), dtype=torch.int32, device=logits.device
@@ -589,7 +593,7 @@ def sparse_attn_indexer_kpool(
                 else:
                     valid = pool_ids >= 0
                     expanded = kpool_ops.expand_pools_to_tokens(
-                        pool_ids, valid, topk_tokens, index_kpool
+                        pool_ids, valid, pool_topk_tokens, index_kpool
                     )
                 topk_indices_buffer[
                     chunk.token_start : chunk.token_end, : expanded.shape[-1]
@@ -802,7 +806,7 @@ def sparse_attn_indexer_kpool(
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
-        select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+        select_k = pool_topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
         if index_kpool > 1:
             pool_topk = torch.empty(
                 (num_rows, select_k), dtype=torch.int32, device=logits.device
