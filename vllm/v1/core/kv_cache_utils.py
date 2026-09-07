@@ -1315,13 +1315,13 @@ def _get_kv_cache_groups_glm5_next(
             return None
         extra_group = KVCacheGroupSpec(list(fitted), extra_uniform)
         spec_config = vllm_config.speculative_config
-        if spec_config is not None and spec_config.use_eagle_block_drop():
-            # This is the drafter's group: flag it so the coordinator applies
-            # the EAGLE last-block drop here only. Left unflagged, the
-            # coordinator flags every group, which widens the Mamba groups'
-            # lookup window past what align-mode checkpointing produces and
-            # silently drops prefix-cache reuse to zero.
-            extra_group.is_eagle_group = True
+        # The drafter group is deliberately left unflagged. This layout flags no
+        # target group, so the coordinator's fallback applies the EAGLE last-block
+        # drop to every group consistently, exactly how MTP runs on this model
+        # (all groups flagged, hit = boundary - one block, served by Mamba).
+        # Flagging only this group made it the sole dropping group: its hit came
+        # back one hash unit shorter than the others', a length the Mamba group
+        # has no state for, and every reconciled hit was vetoed.
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])

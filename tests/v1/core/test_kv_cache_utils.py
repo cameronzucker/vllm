@@ -2506,7 +2506,7 @@ def test_get_kv_cache_config_glm5_carries_gqa_drafter_group(monkeypatch):
     assert fitted.block_size % draft_spec.block_size == 0
     assert mla_spec.block_size % fitted.block_size == 0
     # The drafter's group is the one the coordinator treats as the draft group.
-    assert draft_group.is_eagle_group
+    assert not draft_group.is_eagle_group
     assert fitted.block_size * per_token <= mla_page
     assert fitted.page_size_padded == mla_page
     assert fitted.page_size_bytes == mla_page
